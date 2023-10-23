@@ -1,120 +1,137 @@
-use std::collections::HashMap;
+use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
 use std::time::Instant;
-use rand::prelude::*;
-use indicatif::{ProgressBar, ProgressStyle};
-use ndarray::Array2;
 
-mod wordio;
-use wordio::ScoreMap;
+mod io;
 
+#[inline]
+fn calculate_pattern(guess: &[u8; 5], secret: &[u8; 5]) -> [u8; 5] {
+    assert_eq!(guess.len(), 5);
+    assert_eq!(secret.len(), 5);
 
-fn calculate_score(guess: &str, secret: &str) -> u8 {
     let mut score: [u8; 5] = [0; 5];
-    let guess_chars: Vec<char> = guess.chars().collect();
-    let secret_chars: Vec<char> = secret.chars().collect();
+
+    // Use a frequency table for characters in `secret`.
+    // We use a size of 256 for the array to cover all possible byte values.
+    let mut freq: [u8; 256] = [0; 256];
     let mut used_secret_indices = [false; 5];
 
+    for &s in secret.iter() {
+        freq[s as usize] += 1;
+    }
+
     // Green pass
-    for (i, (g, s)) in guess_chars.iter().zip(secret_chars.iter()).enumerate() {
+    for (i, (g, s)) in guess.iter().zip(secret.iter()).enumerate() {
         if g == s {
             score[i] = 2;
             used_secret_indices[i] = true;
+            // Decrement the frequency since we've found a match.
+            freq[*g as usize] -= 1;
         }
     }
 
     // Yellow pass
-    for (i, g) in guess_chars.iter().enumerate() {
-        if score[i] != 2 {
-            if let Some(index) = secret_chars.iter().enumerate().find(|&(j, &s)| s == *g && !used_secret_indices[j]) {
-                score[i] = 1;
-                used_secret_indices[index.0] = true;
+    for (i, &g) in guess.iter().enumerate() {
+        if score[i] != 2 && freq[g as usize] > 0 {
+            score[i] = 1;
+            freq[g as usize] -= 1;
+        }
+    }
+
+    score
+}
+
+fn entropy(guess: &[u8; 5], allowed_words: &[([u8; 5], u64)]) -> f32 {
+    let mut entropy = 0.0;
+    let mut freq: [u64; 243] = [0; 243];
+    let ternary_powers: [u8; 5] = [1, 3, 9, 27, 81];
+
+    let total_count: u64 = allowed_words.iter().map(|&(_, count)| count).sum();
+
+    for (word, count) in allowed_words.iter() {
+        let pattern = calculate_pattern(guess, word);
+        // Convert pattern to ternary using lookup
+        let index = pattern
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| p * ternary_powers[i])
+            .sum::<u8>();
+        freq[index as usize] += count;
+    }
+
+    for &f in freq.iter() {
+        if f > 0 {
+            let p = f as f32 / total_count as f32;
+            entropy -= p * p.log2();
+        }
+    }
+
+    entropy
+}
+
+fn best_guess(allowed_words: &[([u8; 5], u64)]) -> [u8; 5] {
+    if allowed_words.len() == 1 {
+        return allowed_words[0].0.clone();
+    }
+
+
+    let mut best_word = None;
+    let mut best_entropy = 0.0;
+    for (word, _count) in allowed_words.iter() {
+        let e = entropy(word, allowed_words);
+        if e > best_entropy {
+            best_entropy = e;
+            best_word = Some(word);
+        }
+    }
+    best_word
+        .expect("There should be at least one allowed word")
+        .to_owned()
+        
+}
+
+fn reduce_allowed_words(
+    allowed_words: &[([u8; 5], u64)],
+    guess: &[u8; 5],
+    pattern: [u8; 5],
+) -> Vec<([u8; 5], u64)> {
+    allowed_words
+        .iter()
+        .filter_map(|(word, count)| {
+            if calculate_pattern(guess, word) == pattern {
+                Some((word.clone(), *count))
+            } else {
+                None
             }
-        }
-    }
-
-    // Convert to base 3
-    let mut result = 0;
-    for (i, v) in score.iter().enumerate() {
-        result += u8::pow(3, i as u32) * *v;
-    }
-
-    result
+        })
+        .collect()
 }
 
-#[allow(dead_code)]
-fn score_to_array(score: &i32) -> [i32; 5] {
-    let mut result = [0; 5];
-    let mut score = *score;
-    for item in &mut result {
-        *item = score % 3;
-        score /= 3;
-    }
-    result
-}
-
-fn precalculate_scores(allowed_words: &HashMap<String, usize>) -> ScoreMap {
-    let pb = ProgressBar::new(allowed_words.len() as u64 * allowed_words.len() as u64);
-    pb.set_style(ProgressStyle::default_bar()
-        .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
-        .expect("Failed to set progress bar style")
-        .progress_chars("##-"));
-
-    let mut score_map = Array2::<u8>::zeros((allowed_words.len(), allowed_words.len()));
-
-    for (guess, guess_idx) in allowed_words.iter() {
-        for (secret, secret_idx) in allowed_words.iter() {
-            score_map[(*guess_idx, *secret_idx)] = calculate_score(guess, secret);
-            pb.inc(1);
-        }
-    }
-    pb.finish();
-
-    ScoreMap { map: score_map }
-}
-
-fn best_guess(allowed_words: &HashMap<String, usize>, _score_map: &ScoreMap) -> (String, usize) {
-    // Choose the guess that reduces the option set the most
-    let mut rng = rand::thread_rng();
-
-    let (guess, guess_idx) = allowed_words.iter().choose(&mut rng).unwrap();
-
-    (guess.clone(), *guess_idx)
-}
-
-fn reduce_allowed_words(allowed_words: &HashMap<String, usize>, guess_idx: usize, score: u8, score_map: &ScoreMap) -> HashMap<String, usize> {
-    let mut new_allowed_words = allowed_words.clone();
-
-    for possible_secret in allowed_words.clone() {
-        if score_map.map[(guess_idx,possible_secret.1)] != score {
-            new_allowed_words.remove(&possible_secret.0);
-        }
-    }
-
-    new_allowed_words
-    
-}
-
-fn simulate_game(allowed_words: &HashMap<String, usize>, secret: &str, score_map: &ScoreMap) -> (bool, i32) {    
+fn simulate_game(
+    allowed_words: &[([u8; 5], u64)],
+    secret: &[u8; 5],
+    initial_guess: &[u8; 5],
+) -> (bool, i32) {
     let mut is_solved = false;
-    let mut allowed_words = allowed_words.clone();
-    let mut final_score = 0;
-    let secret_idx = *allowed_words.get(secret).unwrap();
+    let mut final_score = 1;
+
+    assert_eq!(initial_guess.len(), 5);
+    let pattern = calculate_pattern(initial_guess, secret);
+    let mut allowed_words = reduce_allowed_words(allowed_words, initial_guess, pattern);
 
     while !is_solved {
-        let (_guess, guess_idx) = best_guess(&allowed_words, score_map);
-        let score = score_map.map[(guess_idx,secret_idx)];
+        let guess = best_guess(&allowed_words);
+        let pattern = calculate_pattern(&guess, secret);
 
+        // dbg!(&guess, secret, pattern);
 
+        allowed_words = reduce_allowed_words(&allowed_words, &guess, pattern);
 
-        allowed_words = reduce_allowed_words(&allowed_words, guess_idx, score, score_map);
-
-        
         final_score += 1;
 
-        if score == 242 {
+        if pattern == [2; 5] && final_score <= 6 {
             is_solved = true;
-        } else if final_score > 5 {
+        } else if pattern == [2; 5] {
             break;
         }
     }
@@ -122,42 +139,26 @@ fn simulate_game(allowed_words: &HashMap<String, usize>, secret: &str, score_map
     (is_solved, final_score)
 }
 
-
-
 fn main() {
-    let possible_words: HashMap<String, usize> = wordio::read_words(PathBuf::from("data/possible_words.txt"));
-    let allowed_words: HashMap<String, usize> = wordio::read_words(PathBuf::from("data/allowed_words.txt"));
-    
-    println!("Loading score map...");
-    let score_map = match wordio::load_score_map() {
-        Some(score_map) => score_map,
-        None => {
-            println!("No score map found, precalculating...");
-            let score_map = precalculate_scores(&allowed_words);
-            println!("Saving score map...");
-            wordio::save_score_map(&score_map);
-            
-            score_map
-        }
-    };
-    println!("Done!");
+    let possible_words = io::read_wordlist(PathBuf::from("data/possible_words.txt"));
+    let allowed_words = io::read_wordlist_counts(PathBuf::from("data/dictionary.txt"));
 
     println!("Running simulations!");
-    let n_simulations = 1;
-
-    let pb = ProgressBar::new(n_simulations*possible_words.len() as u64);
-    pb.set_style(ProgressStyle::default_bar()
-        .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
-        .expect("Failed to set progress bar style")
-        .progress_chars("##-"));
+    let pb = ProgressBar::new(possible_words.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
+            .expect("Failed to set progress bar style")
+            .progress_chars("##-"),
+    );
 
     let mut scores = Vec::new();
     let mut times = Vec::new();
     let mut wins = 0;
-    for secret in possible_words.keys() {
-        for _ in 0..n_simulations {
+    for secret in possible_words.iter() {
+        
             let start_time = Instant::now();
-            let (solved, score)= simulate_game(&allowed_words, secret, &score_map);
+            let (solved, score) = simulate_game(&allowed_words, secret, b"tares");
 
             if solved {
                 wins += 1;
@@ -166,20 +167,85 @@ fn main() {
             scores.push(score);
             times.push(start_time.elapsed().as_millis());
             pb.inc(1);
-        }
+        
     }
-    
+
     pb.finish();
 
-    let average_score = scores.iter().sum::<i32>() as f32 / n_simulations as f32 / possible_words.len() as f32;
-    println!("Average score: {}", average_score);
+    let average_score =
+        scores.iter().sum::<i32>() as f32 / possible_words.len() as f32;
+    println!("Average score: {:.02}", average_score);
 
-    let win_rate = wins as f32 / n_simulations as f32 / possible_words.len() as f32;
-    println!("Win rate: {}", win_rate);
+    let win_rate = wins as f32 / possible_words.len() as f32;
+    println!("Win rate: {:.02}", win_rate * 100.0);
 
-    let average_time = times.iter().sum::<u128>() as f32 / n_simulations as f32 / possible_words.len() as f32;
-    println!("Average time: {} ms", average_time);
+    let average_time =
+        times.iter().sum::<u128>() as f32 / possible_words.len() as f32;
+    println!("Average time: {:.02} ms", average_time);
 
-    let total_time = times.iter().sum::<u128>() / 1000;
-    println!("Total time: {} s", total_time);
+    let total_time = times.iter().sum::<u128>();
+    println!("Total time: {} ms", total_time);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_exact_match() {
+        let guess = b"apple";
+        let secret = b"apple";
+        let expected = [2, 2, 2, 2, 2];
+        assert_eq!(calculate_pattern(guess, secret), expected);
+    }
+
+    #[test]
+    fn test_no_match() {
+        let guess = b"apple";
+        let secret = b"bravo";
+        let expected = [1, 0, 0, 0, 0];
+        assert_eq!(calculate_pattern(guess, secret), expected);
+    }
+
+    #[test]
+    fn test_partial_exact_match() {
+        let guess = b"apple";
+        let secret = b"apric";
+        let expected = [2, 2, 0, 0, 0];
+        assert_eq!(calculate_pattern(guess, secret), expected);
+    }
+
+    #[test]
+    fn test_wrong_locations() {
+        let guess = b"apple";
+        let secret = b"plape";
+        let expected = [1, 1, 1, 1, 2];
+        assert_eq!(calculate_pattern(guess, secret), expected);
+    }
+
+    #[test]
+    fn test_repeated_characters() {
+        let guess = b"apple";
+        let secret = b"ppppp";
+        let expected = [0, 2, 2, 0, 0];
+        assert_eq!(calculate_pattern(guess, secret), expected);
+    }
+
+    #[test]
+    fn test_all_different_characters() {
+        let guess = b"abcde";
+        let secret = b"fghij";
+        let expected = [0, 0, 0, 0, 0];
+        assert_eq!(calculate_pattern(guess, secret), expected);
+    }
+
+    #[test]
+    fn chat_tests() {
+        let guess = b"aaabc";
+        let secret = b"aabbb";
+        let expected = [2, 2, 0, 2, 0];
+
+        assert_eq!(calculate_pattern(guess, secret), expected);
+    }
+
 }
